@@ -123,3 +123,54 @@ job)` 见证），不删 pin、不改数据、不登记版本；删除 pin 后�
 `HistoryMismatch`。两阶段都有稳定 `checksum()`，绑定类型、版本及有序语句或被
 撤回版本。大目录下的比较与写入全部在 SQLite 内以集合方式完成，Python 侧不
 持有目录，单次调用新增峰值分配（`tracemalloc`）远低于 20 MiB。
+
+## SQLite 副本群的维护批次
+
+`replica_waves.py` 在同一套迁移计划之上安排维护批次：同批节点从开批到收批
+都不接读流量，读席位由留在批次外、版本兼容且互不相同的节点独享承接。批次
+选择把"席位匹配 + 全批/故障域额度"一次性建模成内存最小费用流，精确求出
+节点最多、同规模下节点名升序字典序最小的批次，不枚举候选幂集；开批只对每个
+节点读取一次账本，不写任何数据库。
+
+```python
+from replica_waves import (
+    Replica, ReadSlot, WaveUnavailable, open_replica_wave,
+)
+
+replicas = [
+    Replica("a", "/srv/a.db", "east"),
+    Replica("c", "/srv/c.db", "west"),
+]
+slots = [
+    # 席位 X 只能访问 a/c，且只接受 schema v1..v2
+    ReadSlot("X", {"a", "c"}, min_version=1, max_version=2,
+             sql="SELECT value FROM state WHERE id=1"),
+]
+try:
+    with open_replica_wave(
+        replicas,
+        plan,                         # 从 1 连续编号的完整计划，目标为末版本
+        slots,
+        candidates=["a", "c"],       # 允许进本批的节点（可空）
+        limit=2,                     # 全批下线上限
+        zone_limits={"east": 1, "west": 1},  # 必须恰好覆盖所有故障域
+    ) as wave:
+        print(wave.selected)         # 升序节点名元组；开批本身不迁移
+        node, value = wave.read("X")  # 每次在实际库上执行，读最新已提交数据
+        while (name := wave.advance()) is not None:
+            print("migrated", name)  # 按 selected 顺序逐节点 apply_plan 到目标
+except WaveUnavailable:
+    ...  # 连空批都无法让全部席位被互不相同的在线节点承接
+```
+
+- 开批前逐个校验所有节点（含未选中、非候选节点）的账本：缺失或为空抛
+  `HistoryMismatch`，账本必须是计划的精确版本/ checksum 前缀；只调度剩余阶段
+  全是普通 `Migration` 的节点，在线发布等专用阶段不代劳。参数/计划形状非法
+  抛 `ValueError`；即使空批也无法满足全部席位时抛 `WaveUnavailable` 且不改任何
+  节点；可满足但无节点可迁时正常开空批，席位仍可读。
+- 入批节点即使提前迁完也不参与本批读取；`advance()` 失败时已提交节点保留、
+  失败节点按原事务规则整体回退、后续节点不启动，同批仍可读但不能再推进
+  （`RuntimeError`）。关闭上下文不启动任何工作，关闭后读写均抛
+  `RuntimeError`；重开按当时账本重新选择，已达目标的节点不重复执行。
+- 合法规模（最多 256 节点、128 席位、8192 条访问关系）下开批与退出合计新增
+  Python 峰值分配（`tracemalloc`，不含 SQLite 页缓存与输入造库）低于 24 MiB。
