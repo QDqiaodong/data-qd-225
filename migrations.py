@@ -11,6 +11,9 @@ transactions so that old service nodes never have to stop writing:
   the target to enforcing uniqueness.
 
 Only the standard library is used and ordinary plans behave exactly as before.
+``CheckedMigration`` adds exact client-query multiset gates inside the same
+atomic transaction, while :func:`preview_plan` trial-runs a plan and rolls it
+back without publishing its ledger or schema changes.
 """
 from contextlib import closing
 from dataclasses import dataclass
@@ -288,8 +291,227 @@ class RestoreWorkerProfiles:
         ).hexdigest()
 
 
+_CHECK_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
+_QUERY_PARAMETER_RE = re.compile(
+    r"\?(?:[0-9]+)?|[:@][A-Za-z0-9_]+"
+    r"|(?<![A-Za-z0-9_$])\$[A-Za-z0-9_]+"
+)
+
+
+def _mask_sql_tokens(sql):
+    """Replace quoted strings/identifiers and comments with spaces.
+
+    The returned text keeps surrounding whitespace and newlines, allowing
+    structural checks for statement separators and host parameters without
+    being fooled by their occurrences inside literals or comments.
+    """
+    out = []
+    index = 0
+    length = len(sql)
+
+    while index < length:
+        char = sql[index]
+        if char in ("'", '"', "`"):
+            quote = char
+            out.append(" ")
+            index += 1
+            while index < length:
+                if sql[index] == quote:
+                    if index + 1 < length and sql[index + 1] == quote:
+                        out.extend((" ", " "))
+                        index += 2
+                        continue
+                    out.append(" ")
+                    index += 1
+                    break
+                out.append("\n" if sql[index] == "\n" else " ")
+                index += 1
+        elif char == "[":
+            out.append(" ")
+            index += 1
+            while index < length and sql[index] != "]":
+                out.append("\n" if sql[index] == "\n" else " ")
+                index += 1
+            if index < length:
+                out.append(" ")
+                index += 1
+        elif char == "-" and index + 1 < length and sql[index + 1] == "-":
+            while index < length and sql[index] != "\n":
+                out.append(" ")
+                index += 1
+        elif char == "/" and index + 1 < length and sql[index + 1] == "*":
+            depth = 1
+            out.extend((" ", " "))
+            index += 2
+            while index < length and depth:
+                if index + 1 < length and sql[index:index + 2] == "/*":
+                    depth += 1
+                    out.extend((" ", " "))
+                    index += 2
+                elif index + 1 < length and sql[index:index + 2] == "*/":
+                    depth -= 1
+                    out.extend((" ", " "))
+                    index += 2
+                else:
+                    out.append("\n" if sql[index] == "\n" else " ")
+                    index += 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def _validate_readonly_select_sql(sql, field_name):
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("%s must be a non-empty SQL string" % field_name)
+
+    structural = _mask_sql_tokens(sql)
+    if re.match(r"\s*(?:WITH|SELECT)\b", structural, re.IGNORECASE) is None:
+        raise ValueError("%s must be a single read-only SELECT" % field_name)
+
+    body = structural.strip()
+    if body.endswith(";"):
+        body = body[:-1].rstrip()
+    if ";" in body:
+        raise ValueError("%s must contain exactly one SELECT statement" % field_name)
+    if _QUERY_PARAMETER_RE.search(structural) is not None:
+        raise ValueError("%s must not contain bound parameters" % field_name)
+
+
+def _validate_checked_statements(statements):
+    if isinstance(statements, (str, bytes, bytearray)):
+        raise ValueError("statements must be an ordered collection of SQL strings")
+    try:
+        raw = tuple(statements)
+    except TypeError:
+        raise ValueError("statements must be an ordered collection of SQL strings") from None
+    if not raw:
+        raise ValueError("checked migrations require at least one statement")
+    for statement in raw:
+        if not isinstance(statement, str) or not statement.strip():
+            raise ValueError("migration statements must be non-empty SQL strings")
+    return raw
+
+
+def _validate_query_checks(checks):
+    if isinstance(checks, (str, bytes, bytearray)):
+        raise ValueError("checks must be a collection of QueryParity objects")
+    try:
+        raw = tuple(checks)
+    except TypeError:
+        raise ValueError("checks must be a collection of QueryParity objects") from None
+    if not 1 <= len(raw) <= 8:
+        raise ValueError("between 1 and 8 query parity checks are required")
+
+    names = set()
+    for check in raw:
+        if not isinstance(check, QueryParity):
+            raise ValueError("every check must be a QueryParity instance")
+        if check.name in names:
+            raise ValueError("query parity check names must be unique in a phase")
+        names.add(check.name)
+    return raw
+
+
+@dataclass(frozen=True)
+class QueryParity:
+    """One exact multiset equivalence check for a checked migration."""
+
+    name: str
+    columns: int
+    before_sql: str
+    after_sql: str
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or _CHECK_NAME_RE.fullmatch(self.name) is None:
+            raise ValueError(
+                "check name must be 1-32 ASCII letters, digits, underscores or hyphens"
+            )
+        if type(self.columns) is not int or not 1 <= self.columns <= 8:
+            raise ValueError("columns must be a non-boolean integer from 1 to 8")
+        _validate_readonly_select_sql(self.before_sql, "before_sql")
+        _validate_readonly_select_sql(self.after_sql, "after_sql")
+
+
+@dataclass(frozen=True)
+class CheckedMigration:
+    """An atomic ordinary SQL phase guarded by exact query parity checks."""
+
+    version: int
+    statements: tuple
+    checks: tuple
+
+    def __post_init__(self):
+        if type(self.version) is not int or not 1 <= self.version <= _SQLITE_MAX_INTEGER:
+            raise ValueError("checked migration version must be a positive SQLite integer")
+        object.__setattr__(
+            self, "statements", _validate_checked_statements(self.statements)
+        )
+        object.__setattr__(self, "checks", _validate_query_checks(self.checks))
+
+    def checksum(self):
+        payload = json.dumps(
+            {
+                "kind": "query-parity-checked-migration",
+                "version": self.version,
+                "statements": list(self.statements),
+                "checks": [
+                    {
+                        "name": check.name,
+                        "columns": check.columns,
+                        "before_sql": check.before_sql,
+                        "after_sql": check.after_sql,
+                    }
+                    for check in self.checks
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            ("query-parity-checked-migration\x00" + payload).encode()
+        ).hexdigest()
+
+
 class HistoryMismatch(Exception):
     pass
+
+
+class QueryParityError(Exception):
+    """Base class for query parity gate failures."""
+
+
+class QueryParityShape(QueryParityError):
+    """A parity query returned the wrong number of columns."""
+
+    def __init__(self, version, check_name, side, expected_columns, actual_columns):
+        self.version = version
+        self.check_name = check_name
+        self.side = side
+        self.expected_columns = expected_columns
+        self.actual_columns = actual_columns
+        super().__init__(
+            "query parity shape mismatch for version %s check %r on %s: "
+            "expected %d columns, got %d"
+            % (version, check_name, side, expected_columns, actual_columns)
+        )
+
+
+class QueryParityMismatch(QueryParityError):
+    """One row multiset has different multiplicities on the two sides."""
+
+    def __init__(self, version, check_name, row, before_count, after_count):
+        self.version = version
+        self.check_name = check_name
+        self.row = row
+        self.before_count = before_count
+        self.after_count = after_count
+        super().__init__(
+            "query parity mismatch for version %s check %r at row %r: "
+            "before count %d, after count %d"
+            % (version, check_name, row, before_count, after_count)
+        )
 
 
 class ProfileRestoreBlocked(Exception):
@@ -409,6 +631,10 @@ def _parse_plan(plan, require_online=False, online_last=False):
             raise ValueError("plans must be complete and numbered consecutively from 1")
         if isinstance(item, OnlineUnique):
             online = item
+        elif isinstance(item, CheckedMigration):
+            # Query-gated phases are ordinary atomic ledger phases; apply_plan
+            # executes their SQL and parity gates in its write transaction.
+            pass
         elif isinstance(item, ReleaseArtifactReclaim):
             # The reclaim phase carries no SQL statements but is an ordinary,
             # atomic ledger phase handled by apply_plan itself.
@@ -1082,6 +1308,262 @@ def _apply_worker_profile_restore(db, restore):
 
 
 # --------------------------------------------------------------------------
+# Query parity gates
+
+
+_QUERY_PARITY_FETCH_BATCH = 64
+_ALLOWED_QUERY_AUTHORIZER_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+}
+if hasattr(sqlite3, "SQLITE_RECURSIVE"):
+    _ALLOWED_QUERY_AUTHORIZER_ACTIONS.add(sqlite3.SQLITE_RECURSIVE)
+
+
+def _is_reserved_relation(name):
+    if not isinstance(name, str):
+        return False
+    folded = name.casefold()
+    return (
+        folded == _LEDGER.casefold()
+        or folded == _STATE.casefold()
+        or re.match(r"_online_u[0-9]+_", folded) is not None
+        or folded.startswith("_worker_profile_")
+        or folded.startswith("_migration_qp_")
+        or folded.startswith("_migration_reclaim_")
+    )
+
+
+def _query_authorizer(action, first, second, schema, source):
+    if action not in _ALLOWED_QUERY_AUTHORIZER_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_READ:
+        # Parity queries read committed application objects only.  All staging
+        # tables are private TEMP objects and must never be query inputs.
+        if schema == "temp" or _is_reserved_relation(first):
+            return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _query_parity_name(version, check_index, suffix):
+    return "_migration_qp_%s_%d_%d" % (suffix, version, check_index)
+
+
+def _stage_parity_query(db, check, side, version, check_index, table_name):
+    """Execute one parity SELECT once and stream its rows into a TEMP table."""
+    sql = check.before_sql if side == "before" else check.after_sql
+    cursor = None
+    try:
+        db.set_authorizer(_query_authorizer)
+        try:
+            cursor = db.execute(sql)
+        finally:
+            db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+
+        description = cursor.description or ()
+        actual_columns = len(description)
+        if actual_columns != check.columns:
+            raise QueryParityShape(
+                version,
+                check.name,
+                side,
+                check.columns,
+                actual_columns,
+            )
+
+        quoted_table = _quote(table_name)
+        columns_sql = ", ".join(_quote("c%d" % i) for i in range(actual_columns))
+        db.execute("DROP TABLE IF EXISTS temp." + quoted_table)
+        db.execute(
+            "CREATE TEMP TABLE %s (%s)" % (quoted_table, columns_sql)
+        )
+        marks = ",".join("?" for _ in range(actual_columns))
+        insert_sql = "INSERT INTO %s VALUES (%s)" % (quoted_table, marks)
+
+        # Fetch in small batches so a result much larger than memory is handled
+        # by SQLite's temporary storage, not by a Python list of all rows.
+        while True:
+            rows = cursor.fetchmany(_QUERY_PARITY_FETCH_BATCH)
+            if not rows:
+                break
+            db.executemany(insert_sql, rows)
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+
+def _create_parity_group_table(db, raw_name, group_name, column_count):
+    """Build exact multiplicity groups while retaining storage types."""
+    raw = _quote(raw_name)
+    group = _quote(group_name)
+
+    select_parts = []
+    group_parts = []
+    index_parts = []
+    for index in range(column_count):
+        column = _quote("c%d" % index)
+        type_alias = "t%d" % index
+        value_alias = "v%d" % index
+        type_expression = "typeof(src.%s)" % column
+        value_expression = "src.%s" % column
+        select_parts.append("%s AS %s" % (type_expression, type_alias))
+        select_parts.append("%s AS %s" % (value_expression, value_alias))
+        group_parts.append(type_expression)
+        group_parts.append(value_expression)
+        index_parts.append(_quote(type_alias))
+        index_parts.append(_quote(value_alias))
+
+    db.execute("DROP TABLE IF EXISTS temp." + group)
+    db.execute(
+        "CREATE TEMP TABLE %s AS "
+        "SELECT %s, COUNT(*) AS qp_count "
+        "FROM %s AS src GROUP BY %s"
+        % (
+            group,
+            ", ".join(select_parts),
+            raw,
+            ", ".join(group_parts),
+        )
+    )
+    index_name = _quote(group_name + "_uniq")
+    db.execute(
+        "CREATE UNIQUE INDEX %s ON %s (%s)"
+        % (index_name, group, ", ".join(index_parts))
+    )
+
+
+def _parity_join_condition(column_count, left_alias, right_alias):
+    clauses = []
+    for index in range(column_count):
+        type_column = _quote("t%d" % index)
+        value_column = _quote("v%d" % index)
+        # The adjacent typeof comparison separates INTEGER from REAL and TEXT
+        # from BLOB.  IS gives exact NULL-safe equality; equal REAL zeroes and
+        # BINARY text comparison match the required storage semantics.
+        clauses.append(
+            "%s.%s IS %s.%s AND %s.%s IS %s.%s"
+            % (
+                left_alias, type_column,
+                right_alias, type_column,
+                left_alias, value_column,
+                right_alias, value_column,
+            )
+        )
+    return " AND ".join(clauses)
+
+
+def _parity_witness_select(column_count, alias):
+    return ", ".join(
+        "%s.%s AS w%d" % (alias, _quote("v%d" % index), index)
+        for index in range(column_count)
+    )
+
+
+def _compare_parity_groups(db, check, version, before_group, after_group):
+    n = check.columns
+    before = "temp." + _quote(before_group)
+    after = "temp." + _quote(after_group)
+    values = _parity_witness_select(n, "side")
+
+    # First look for a before row that is absent or has a changed count.
+    condition = _parity_join_condition(n, "side", "other")
+    before_sql = (
+        "SELECT %s, side.qp_count AS before_count, other.qp_count AS after_count "
+        "FROM %s AS side LEFT JOIN %s AS other ON %s "
+        "WHERE other.qp_count IS NULL OR side.qp_count <> other.qp_count "
+        "LIMIT 1"
+        % (values, before, after, condition)
+    )
+    record = db.execute(before_sql).fetchone()
+    if record is not None:
+        row = tuple(record[:n])
+        before_count = int(record[n])
+        after_count = 0 if record[n + 1] is None else int(record[n + 1])
+        raise QueryParityMismatch(
+            version, check.name, row, before_count, after_count
+        )
+
+    # Then look for an after-only row.  Count-changing rows were found above.
+    condition = _parity_join_condition(n, "side", "other")
+    after_sql = (
+        "SELECT %s, other.qp_count AS before_count, side.qp_count AS after_count "
+        "FROM %s AS side LEFT JOIN %s AS other ON %s "
+        "WHERE other.qp_count IS NULL OR side.qp_count <> other.qp_count "
+        "LIMIT 1"
+        % (values, after, before, condition)
+    )
+    record = db.execute(after_sql).fetchone()
+    if record is not None:
+        row = tuple(record[:n])
+        before_count = 0 if record[n] is None else int(record[n])
+        after_count = int(record[n + 1])
+        raise QueryParityMismatch(
+            version, check.name, row, before_count, after_count
+        )
+
+
+def _apply_checked_migration(db, migration):
+    """Capture all before multisets, migrate, then evaluate after multisets."""
+    before_groups = []
+    staging_names = []
+    for index in range(len(migration.checks)):
+        staging_names.extend((
+            _query_parity_name(migration.version, index, "rawb"),
+            _query_parity_name(migration.version, index, "grpb"),
+            _query_parity_name(migration.version, index, "rawa"),
+            _query_parity_name(migration.version, index, "grpa"),
+        ))
+
+    try:
+        # Every before query is prepared against the pre-phase transaction state.
+        for index, check in enumerate(migration.checks):
+            raw_name = _query_parity_name(migration.version, index, "rawb")
+            group_name = _query_parity_name(migration.version, index, "grpb")
+            _stage_parity_query(
+                db, check, "before", migration.version, index, raw_name
+            )
+            _create_parity_group_table(db, raw_name, group_name, check.columns)
+            db.execute("DROP TABLE temp." + _quote(raw_name))
+            before_groups.append(group_name)
+
+        db.set_authorizer(_authorize)
+        try:
+            for statement in migration.statements:
+                cursor = db.execute(statement)
+                # Finalize any read-only result statement before parity reads.
+                cursor.close()
+        finally:
+            db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+
+        # Execute and compare after queries in declaration order, stopping at the
+        # first failed check so later queries cannot obscure this phase's result.
+        for index, check in enumerate(migration.checks):
+            raw_name = _query_parity_name(migration.version, index, "rawa")
+            after_group = _query_parity_name(migration.version, index, "grpa")
+            before_group = before_groups[index]
+            _stage_parity_query(
+                db, check, "after", migration.version, index, raw_name
+            )
+            _create_parity_group_table(db, raw_name, after_group, check.columns)
+            db.execute("DROP TABLE temp." + _quote(raw_name))
+            _compare_parity_groups(
+                db, check, migration.version, before_group, after_group
+            )
+            db.execute("DROP TABLE temp." + _quote(after_group))
+            db.execute("DROP TABLE temp." + _quote(before_group))
+    finally:
+        # Successful checks have already dropped these; this mainly releases
+        # staging immediately on shape/parity/SQL failure.  The plan runner
+        # still closes the connection and rolls back the main transaction.
+        for name in staging_names:
+            try:
+                db.execute("DROP TABLE IF EXISTS temp." + _quote(name))
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------
 # Ordinary plans
 
 
@@ -1095,16 +1577,22 @@ def _authorize(action, first, second, *_):
     } else sqlite3.SQLITE_OK
 
 
-def apply_plan(path, plan):
+def _run_plan(path, plan, preview):
     plan, online = _parse_plan(plan)
     keys = _plan_keys(plan)
 
-    with closing(_open(path)) as db, db:
+    db = _open(path)
+    try:
         db.execute("PRAGMA foreign_keys=ON")
+        # Keep large exact-multiset staging in SQLite temp files rather than
+        # Python memory.  This is connection-local and changes no app setting.
+        db.execute("PRAGMA temp_store=FILE")
         db.execute("BEGIN IMMEDIATE")
         db.execute("""CREATE TABLE IF NOT EXISTS _migration_ledger (
             version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)""")
-        history = db.execute("SELECT version,checksum FROM _migration_ledger ORDER BY version").fetchall()
+        history = db.execute(
+            "SELECT version,checksum FROM _migration_ledger ORDER BY version"
+        ).fetchall()
         if history != keys[:len(history)]:
             raise HistoryMismatch("applied plan is not an exact prefix")
 
@@ -1142,7 +1630,9 @@ def apply_plan(path, plan):
 
         applied = []
         for migration, (_, checksum) in zip(pending, keys[len(history):]):
-            if isinstance(migration, WorkerProfileRollout):
+            if isinstance(migration, CheckedMigration):
+                _apply_checked_migration(db, migration)
+            elif isinstance(migration, WorkerProfileRollout):
                 _apply_worker_profile_rollout(db, migration)
             elif isinstance(migration, RestoreWorkerProfiles):
                 _apply_worker_profile_restore(db, migration)
@@ -1155,6 +1645,41 @@ def apply_plan(path, plan):
                         db.execute(statement)
                 finally:
                     db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
-            db.execute("INSERT INTO _migration_ledger VALUES (?,?)", (migration.version, checksum))
+            db.execute(
+                "INSERT INTO _migration_ledger VALUES (?,?)",
+                (migration.version, checksum),
+            )
             applied.append(migration.version)
+
+        if preview:
+            # Roll back schema, rows, ledger rows and every internal change.
+            # Private TEMP staging tables are also removed when db closes.
+            db.rollback()
+        else:
+            db.commit()
         return applied
+    except BaseException:
+        try:
+            db.rollback()
+        except Exception:
+            # Preserve the original migration/query error as the raised error.
+            pass
+        raise
+    finally:
+        db.close()
+
+
+def apply_plan(path, plan):
+    """Apply all pending phases atomically and return newly registered versions."""
+    return _run_plan(path, plan, False)
+
+
+def preview_plan(path, plan):
+    """Trial-run the pending plan in a write transaction, then roll it back.
+
+    The returned list is exactly the list of versions a successful
+    :func:`apply_plan` call at this database state would register.  Repeating
+    the real application performs and judges every query again in its own
+    transaction; a preview result is never used as commit evidence.
+    """
+    return _run_plan(path, plan, True)

@@ -11,6 +11,48 @@ python3 -B demo.py
 
 错误批次输出 `after rollback: ['id']`，改用有效计划则显示 `upgrade: [2]` 和 `retry: []`。
 
+## 查询等价闸门与预演
+
+`CheckedMigration(version, statements, checks)` 是可放入完整连续计划的普通原子
+阶段。它先在**当前事务状态**中按声明顺序执行 1–8 个 `QueryParity` 的前查询，
+再执行有序迁移 SQL，然后按同一顺序执行后查询并比较整行多重集；第一个失败检查
+会中止批次。迁移 SQL、等价判定和账本登记仍在同一个 `BEGIN IMMEDIATE` 事务中，
+任何错误都回滚本批全部改动。
+
+```python
+from migrations import (
+    CheckedMigration, QueryParity, apply_plan, preview_plan,
+    QueryParityShape, QueryParityMismatch,
+)
+
+name_parity = QueryParity(
+    "event-names",          # 1–32 个 [A-Za-z0-9_-]，阶段内唯一
+    1,                      # 非布尔 int，1–8
+    "SELECT name FROM old_events",
+    "SELECT name FROM new_events",
+)
+checked = CheckedMigration(2, (
+    "CREATE TABLE new_events(name TEXT NOT NULL)",
+    "INSERT INTO new_events SELECT name FROM old_events WHERE eligible = 1",
+), [name_parity])
+
+preview_plan(path, plan)    # 返回若提交会登记的版本，但整体回滚
+apply_plan(path, plan)      # 每次都在新写事务中重新执行查询和判定
+```
+
+比较忽略列名和行顺序，但不忽略每行的出现次数或 SQLite 存储类型：`1` 与 `1.0`、
+`'x'` 与 `x'78'`、不同大小写文本均不等价；NULL 只等于 NULL，`-0.0` 与 `0.0`
+相等。列数错误抛 `QueryParityShape(version, check_name, side,
+expected_columns, actual_columns)`；多重集不等抛
+`QueryParityMismatch(version, check_name, row, before_count, after_count)`。
+checksum 绑定阶段类型、版本、有序 SQL，以及检查顺序、名称、列数和两段原始 SQL；
+已登记阶段重放为 no-op，改动任一项会按原规则抛 `HistoryMismatch`。
+
+大结果集每侧只执行一次，Python 侧只流式取小批量行；精确计数、类型键和连接索引
+都放在 SQLite TEMP 表中，关闭连接即释放，不把查询结果写入应用库。副本波次仍只
+主动安排剩余阶段全部是精确 `Migration` 类型的节点；已登记的 `CheckedMigration`
+前缀可正常通过账本校验。
+
 ## 在线唯一性发布
 
 计划中可包含一个 `OnlineUnique(version, table)`，用于给已有表的
