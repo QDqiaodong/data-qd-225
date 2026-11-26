@@ -47,3 +47,37 @@ publish_online_unique(path, plan)          # ("published", None) 或冲突/未�
 在 prepare 与 publish 之间用别的普通迁移推进账本；发布后完整计划可重放，并
 可继续原子应用之后不触碰该唯一性的普通迁移。所有入口只依赖数据库内可索引的
 工作量，单行旧写入的额外成本与表大小、重复组大小无关。
+
+## 维护窗口内回收发布制品
+
+计划中可以加入普通阶段
+`ReleaseArtifactReclaim(version, candidate_ids, max_releases)`。候选 ID 为
+1–20 个不同的正 SQLite 整数（拒绝布尔值），`max_releases` 为 1–8；版本仍须
+满足计划从 1 连续编号的规则。候选顺序不参与 checksum，checksum 绑定类型、
+版本、排序后的候选集合和额度。
+
+```python
+from migrations import Migration, ReleaseArtifactReclaim, apply_plan
+
+plan = [
+    Migration(1, ("CREATE TABLE releases(...)", ...)),
+    ReleaseArtifactReclaim(2, [5, 2, 4, 3], max_releases=2),
+]
+apply_plan(path, plan)
+```
+
+执行时只选择候选中实际存在且 `retired=1` 的发布；活跃或不存在的 ID 不占用
+删除额度。一个制品只有在本阶段开始时至少有一个持有者，并且全部持有者都属于
+最终选中的发布集合时才删除。未列入候选、仍活跃或未选中的持有者都会阻止释放；
+历史无主制品不计收益也不删除。
+
+选择算法把每个可由候选解释的制品持有者集合编码成位掩码，在有界临时表中完成
+子集 zeta 汇总，然后精确比较所有不超过额度的集合：先最大化登记字节数，收益
+相同则减少发布数，仍相同则选择数值 ID 升序序列中字典序最小者。目录扫描量只
+与目录/关联行数相关，不随候选组合数倍增；Python 侧只流式读取评分行，最大
+候选规模下新增 Python 峰值远低于 32 MiB，主要临时空间由 SQLite 管理。
+
+该阶段与普通 SQL、账本写入处于同一个 `apply_plan` 事务；后续阶段失败会连同
+回收删除和账本记录一起回滚。准确计划重放为 no-op；改变候选集合或额度会因
+checksum 不同抛出 `HistoryMismatch`。它也可以位于已发布的 `OnlineUnique`
+之后；未发布的在线版本仍按原规则阻止账本推进。

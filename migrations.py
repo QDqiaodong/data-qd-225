@@ -60,6 +60,70 @@ class OnlineUnique:
         return hashlib.sha256(("online-unique\x00" + payload).encode()).hexdigest()
 
 
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+
+
+@dataclass(frozen=True)
+class ReleaseArtifactReclaim:
+    """Atomically retire a bounded, optimal subset of candidate releases.
+
+    Candidate order is intentionally not identity: checksums bind the sorted
+    candidate set, version and release quota.
+    """
+
+    version: int
+    candidate_ids: tuple
+    max_releases: int
+
+    def __post_init__(self):
+        if type(self.version) is not int or not 1 <= self.version <= _SQLITE_MAX_INTEGER:
+            raise ValueError("reclaim version must be a positive SQLite integer")
+
+        if isinstance(self.candidate_ids, (str, bytes, bytearray)):
+            raise ValueError("candidate_ids must be a collection of integer ids")
+        try:
+            raw_ids = tuple(self.candidate_ids)
+        except TypeError:
+            raise ValueError("candidate_ids must be a collection of integer ids") from None
+
+        if not 1 <= len(raw_ids) <= 20:
+            raise ValueError("between 1 and 20 candidate ids are required")
+
+        seen = set()
+        for candidate_id in raw_ids:
+            # ``type(...) is int`` deliberately rejects bool.
+            if type(candidate_id) is not int:
+                raise ValueError("candidate ids must be integers")
+            if not 1 <= candidate_id <= _SQLITE_MAX_INTEGER:
+                raise ValueError("candidate ids must be positive SQLite integer ids")
+            if candidate_id in seen:
+                raise ValueError("candidate ids must be distinct")
+            seen.add(candidate_id)
+
+        if type(self.max_releases) is not int or not 1 <= self.max_releases <= 8:
+            raise ValueError("max_releases must be an integer between 1 and 8")
+
+        # Canonicalize only after validating; input ordering has no historical
+        # meaning for this phase.
+        object.__setattr__(self, "candidate_ids", tuple(sorted(raw_ids)))
+
+    def checksum(self):
+        payload = json.dumps(
+            {
+                "kind": "release-artifact-reclaim",
+                "version": self.version,
+                "candidate_ids": list(self.candidate_ids),
+                "max_releases": self.max_releases,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            ("release-artifact-reclaim\x00" + payload).encode()
+        ).hexdigest()
+
+
 class HistoryMismatch(Exception):
     pass
 
@@ -169,6 +233,10 @@ def _parse_plan(plan, require_online=False, online_last=False):
             raise ValueError("plans must be complete and numbered consecutively from 1")
         if isinstance(item, OnlineUnique):
             online = item
+        elif isinstance(item, ReleaseArtifactReclaim):
+            # The reclaim phase carries no SQL statements but is an ordinary,
+            # atomic ledger phase handled by apply_plan itself.
+            pass
         else:
             if not getattr(item, "statements", None) or not callable(
                 getattr(item, "checksum", None)
@@ -466,6 +534,204 @@ def publish_online_unique(path, plan):
 
 
 # --------------------------------------------------------------------------
+# Release artifact reclamation
+
+
+_RECLAIM_TEMP_TABLE = "_migration_reclaim_blobs"
+_RECLAIM_WEIGHT_TEMP_TABLE = "_migration_reclaim_weights"
+_RECLAIM_SCORE_TEMP_TABLE = "_migration_reclaim_scores"
+
+
+def _select_release_reclaim(db, reclaim):
+    """Return ``(selected_release_ids, selected_mask)``.
+
+    Catalog reads are set-based/index-assisted.  Scoring uses bounded SQLite
+    temporary tables: one holder-mask/weight row per distinct mask and at most
+    sum(C(20, s), s=0..max_releases) subset rows.
+    """
+    requested = reclaim.candidate_ids
+    requested_marks = ",".join("?" for _ in requested)
+    eligible = [
+        row[0]
+        for row in db.execute(
+            "SELECT id FROM releases "
+            "WHERE retired=1 AND id IN (" + requested_marks + ") ORDER BY id",
+            requested,
+        )
+    ]
+    count = len(eligible)
+    if count == 0:
+        return (), 0
+
+    names = {f"e{i}": release_id for i, release_id in enumerate(eligible)}
+    holder_terms = " + ".join(
+        f"MAX(CASE WHEN rb.release_id=:e{i} THEN {1 << i} ELSE 0 END)"
+        for i in range(count)
+    )
+    eligible_list = ",".join(f":e{i}" for i in range(count))
+    temp_table = _quote(_RECLAIM_TEMP_TABLE)
+
+    # The inner lookup starts from candidate releases via the release_id
+    # leading column of the primary key.  The outer blob_id lookup then uses
+    # the supplied (blob_id, release_id) index to inspect every holder.  The
+    # HAVING clause retains only blobs whose holders are all eligible
+    # candidates.  A later subset mask checks whether all of those holders are
+    # in the chosen batch.
+    db.execute("DROP TABLE IF EXISTS temp." + temp_table)
+    db.execute(
+        "CREATE TEMP TABLE " + temp_table + " ("
+        "blob_id INTEGER PRIMARY KEY, "
+        "holder_mask INTEGER NOT NULL, "
+        "size_bytes INTEGER NOT NULL)"
+    )
+    db.execute(
+        "INSERT INTO " + temp_table + " (blob_id, holder_mask, size_bytes) "
+        "SELECT rb.blob_id, " + holder_terms + ", MAX(b.size_bytes) "
+        "FROM release_blobs rb "
+        "JOIN blobs b ON b.id = rb.blob_id "
+        "WHERE rb.blob_id IN ("
+        "SELECT blob_id FROM release_blobs WHERE release_id IN (" + eligible_list + ")"
+        ") "
+        "GROUP BY rb.blob_id "
+        "HAVING SUM(CASE WHEN rb.release_id IN (" + eligible_list + ") "
+        "THEN 0 ELSE 1 END) = 0",
+        names,
+    )
+
+    quota = min(reclaim.max_releases, count)
+    weight_table = _quote(_RECLAIM_WEIGHT_TEMP_TABLE)
+    score_table = _quote(_RECLAIM_SCORE_TEMP_TABLE)
+    db.execute("DROP TABLE IF EXISTS temp." + weight_table)
+    db.execute("DROP TABLE IF EXISTS temp." + score_table)
+
+    # Aggregate duplicate holder masks before scoring.  Both temporary tables
+    # have bounded size: at most one weight row per catalog blob and one score
+    # row per subset of at most max_releases candidates.
+    db.execute(
+        "CREATE TEMP TABLE " + weight_table + " ("
+        "holder_mask INTEGER PRIMARY KEY, total_bytes INTEGER NOT NULL)"
+    )
+    db.execute(
+        "INSERT INTO " + weight_table + " "
+        "SELECT holder_mask, SUM(size_bytes) FROM " + temp_table + " "
+        "GROUP BY holder_mask"
+    )
+    db.execute(
+        "CREATE TEMP TABLE " + score_table + " ("
+        "mask INTEGER PRIMARY KEY, release_count INTEGER NOT NULL, "
+        "benefit INTEGER NOT NULL)"
+    )
+    db.execute(
+        """
+        WITH RECURSIVE
+        bits(bit) AS (
+            SELECT 0
+            UNION ALL
+            SELECT bit + 1 FROM bits WHERE bit < ?
+        ),
+        subsets(mask, release_count, last_bit) AS (
+            SELECT 0, 0, -1
+            UNION ALL
+            SELECT subsets.mask | (1 << bits.bit),
+                   subsets.release_count + 1,
+                   bits.bit
+            FROM subsets
+            JOIN bits ON bits.bit > subsets.last_bit
+            WHERE subsets.release_count < ?
+        )
+        INSERT INTO """ + score_table + """ (mask, release_count, benefit)
+        SELECT subsets.mask,
+               subsets.release_count,
+               COALESCE(""" + weight_table + """.total_bytes, 0)
+        FROM subsets
+        LEFT JOIN """ + weight_table + """
+          ON """ + weight_table + """.holder_mask = subsets.mask
+        """,
+        (count - 1, quota),
+    )
+
+    # Set-based subset zeta transform.  For each bit, add the score of the
+    # mask without that bit.  Every required source mask has one fewer bit and
+    # therefore exists in the bounded score table.  At completion,
+    # benefit[mask] is the sum of all exact holder masks contained in mask.
+    for bit_index in range(count):
+        bit = 1 << bit_index
+        db.execute(
+            "UPDATE " + score_table + " "
+            "SET benefit = benefit + COALESCE(("
+            "SELECT source.benefit FROM " + score_table + " AS source "
+            "WHERE source.mask = " + score_table + ".mask - ?), 0) "
+            "WHERE (mask & ?) <> 0",
+            (bit, bit),
+        )
+
+    best_mask = 0
+    best_count = 0
+    best_benefit = 0
+
+    # Stream rows instead of fetching all scores into Python.  Tie comparison
+    # uses the lowest differing bit: the mask containing that bit has the
+    # lexicographically smaller ascending-id sequence.
+    cursor = db.execute(
+        "SELECT mask, benefit, release_count FROM " + score_table
+    )
+    for mask, benefit, release_count in cursor:
+        replace = False
+        if benefit > best_benefit:
+            replace = True
+        elif benefit == best_benefit:
+            if release_count < best_count:
+                replace = True
+            elif release_count == best_count and mask != best_mask:
+                differing_bit = (mask ^ best_mask) & -(mask ^ best_mask)
+                if mask & differing_bit:
+                    replace = True
+        if replace:
+            best_mask = mask
+            best_count = release_count
+            best_benefit = benefit
+
+    selected_ids = [
+        eligible[index]
+        for index in range(count)
+        if best_mask & (1 << index)
+    ]
+
+    db.execute("DROP TABLE temp." + weight_table)
+    db.execute("DROP TABLE temp." + score_table)
+    return tuple(selected_ids), best_mask
+
+
+def _apply_release_artifact_reclaim(db, reclaim):
+    selected_ids, selected_mask = _select_release_reclaim(db, reclaim)
+    temp_table = _quote(_RECLAIM_TEMP_TABLE)
+
+    if selected_ids:
+        marks = ",".join("?" for _ in selected_ids)
+
+        # Remove child rows first because foreign keys remain enforced and
+        # there are no cascading deletes.
+        db.execute(
+            "DELETE FROM release_blobs WHERE release_id IN (" + marks + ")",
+            selected_ids,
+        )
+        # The temp table recorded only externally unblocked blobs.  The mask
+        # test additionally requires every eligible holder to be selected.
+        db.execute(
+            "DELETE FROM blobs WHERE id IN ("
+            "SELECT blob_id FROM " + temp_table + " "
+            "WHERE (holder_mask & ?) = holder_mask)",
+            (selected_mask,),
+        )
+        db.execute(
+            "DELETE FROM releases WHERE id IN (" + marks + ")",
+            selected_ids,
+        )
+
+    db.execute("DROP TABLE IF EXISTS temp." + temp_table)
+
+
+# --------------------------------------------------------------------------
 # Ordinary plans
 
 
@@ -515,12 +781,15 @@ def apply_plan(path, plan):
 
         applied = []
         for migration, (_, checksum) in zip(pending, keys[len(history):]):
-            db.set_authorizer(_authorize)
-            try:
-                for statement in migration.statements:
-                    db.execute(statement)
-            finally:
-                db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+            if isinstance(migration, ReleaseArtifactReclaim):
+                _apply_release_artifact_reclaim(db, migration)
+            else:
+                db.set_authorizer(_authorize)
+                try:
+                    for statement in migration.statements:
+                        db.execute(statement)
+                finally:
+                    db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
             db.execute("INSERT INTO _migration_ledger VALUES (?,?)", (migration.version, checksum))
             applied.append(migration.version)
         return applied
