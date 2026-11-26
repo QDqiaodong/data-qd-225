@@ -8,11 +8,72 @@ from migrations import (
     ProfileRestoreBlocked,
     RestoreWorkerProfiles,
     WorkerProfileRollout,
+    ack_route_changes,
     apply_plan,
+    finish_route_snapshot,
+    open_route_feed,
     prepare_online_unique,
     publish_online_unique,
+    read_route_changes,
+    read_route_snapshot,
     step_online_unique,
 )
+
+# -- route feed: consistent snapshot then recoverable change batches ------
+with TemporaryDirectory() as root:
+    path = Path(root, "feed.db")
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "CREATE TABLE route_catalog(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+        )
+        db.executemany(
+            "INSERT INTO route_catalog(id,payload) VALUES (?,?)",
+            [(10, b"ten"), (30, b"thirty"), (50, b"fifty")],
+        )
+    bootstrap = Migration(
+        1, ("CREATE TABLE deployment_markers(id INTEGER PRIMARY KEY)",)
+    )
+    apply_plan(path, [bootstrap])
+
+    base = open_route_feed(path, 3)
+    print("feed cut point:", base)
+    pages = []
+    cursor = 0
+    while True:
+        page, cursor = read_route_snapshot(path, cursor, 2)
+        pages.extend(page)
+        if cursor is None:
+            break
+    print("snapshot pages:", pages)
+
+    churn = [
+        bootstrap,
+        Migration(2, (
+            "UPDATE route_catalog SET payload=x'74656e2d78' WHERE id=10",
+            "DELETE FROM route_catalog WHERE id=30",
+            "INSERT INTO route_catalog(id,payload) VALUES (20, x'7477656e7479')",
+        )),
+        Migration(3, (
+            "UPDATE route_catalog SET payload=x'6669667479' WHERE id=50",
+        )),
+    ]
+    print("churn applied:", apply_plan(path, churn))
+    # Snapshot confirmation releases the retained cut point; batches survive.
+    print("snapshot confirmed:", finish_route_snapshot(path, base),
+          "retry:", finish_route_snapshot(path, base))
+    print("first batch:", read_route_changes(path))
+    version, _ = read_route_changes(path)
+    print("ack:", ack_route_changes(path, version),
+          "repeat ack:", ack_route_changes(path, version))
+
+    one_more = churn + [
+        Migration(4, (
+            "INSERT INTO deployment_markers(id) VALUES (1)",
+            "UPDATE route_catalog SET payload=x'66696674792d32' WHERE id=50",
+        )),
+    ]
+    print("next apply:", apply_plan(path, one_more))
+    print("next batch:", read_route_changes(path))
 
 with TemporaryDirectory() as root:
     path = Path(root, "service.db")

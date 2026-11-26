@@ -166,6 +166,76 @@ job)` 见证），不删 pin、不改数据、不登记版本；删除 pin 后�
 撤回版本。大目录下的比较与写入全部在 SQLite 内以集合方式完成，Python 侧不
 持有目录，单次调用新增峰值分配（`tracemalloc`）远低于 20 MiB。
 
+## 路由缓存的可恢复变更投递（route feed）
+
+针对部署表 `route_catalog(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)`，
+执行器在迁移库内提供单库、单消费方的可恢复交付：先装载一个不可变的分页
+快照，再按真实提交顺序追更完整的净变化批次，不另起服务、不持有跨调用连接。
+
+```python
+from migrations import (
+    Migration, RouteFeedFull, RouteFeedState,
+    open_route_feed, read_route_snapshot, finish_route_snapshot,
+    read_route_changes, ack_route_changes, apply_plan, preview_plan,
+)
+
+base = open_route_feed(path, max_pending=256)   # 返回原子确定的切点版本
+after = 0
+while True:
+    rows, after = read_route_snapshot(path, after, limit=256)
+    cache_update(rows)                          # 同一切点，可跨进程重读
+    if after is None:
+        break
+finish_route_snapshot(path, base)               # 快照可靠落地后确认（首次 True）
+
+while True:
+    batch = read_route_changes(path)            # 最早未确认批次，None 表示积压为空
+    if batch is None:
+        break
+    version, entries = batch                    # entries 按 id 升序，删除项 payload 为 None
+    cache_apply(entries)
+    ack_route_changes(path, version)            # 只能确认最早未确认批次
+```
+
+- `open_route_feed(path, max_pending)` 在一个写事务内同时读取已登记的最高版本
+  并全量扫描目录写入私有快照表，两者来自同一数据库状态；此后任何分页都不受
+  现表增删改影响。同额度重调返回原切点且不清进度，换额度抛 `RouteFeedState`。
+  `max_pending`（1–16384，拒绝布尔值）限制**未确认变更条目总数**。
+- `read_route_snapshot(path, after_id, limit)` 只在快照确认前可用，按 id 升序
+  返回严格大于游标的前 `limit`（1–256）行；空页的 `next_after` 为 `None`，
+  同一游标可重复读取，读页不改变任何状态。
+- `finish_route_snapshot(path, base_version)` 首次确认返回 `True`、重试 `False`；
+  确认后释放快照保留行且不能再读旧快照，但装载期间积累的增量全部保留。
+- `read_route_changes(path)` 只在快照确认后可用，返回最早未确认的完整批次
+  `(version, entries)`，空积压返回 `None`；批次不可拆分，`version` 是该次
+  `apply_plan` 实际登记的最高版本（可不连续）。重复读取不推进进度，重开
+  进程后仍是同一批。
+- `ack_route_changes(path, version)` 仅接受最早未确认批次：删除该批并返还
+  对应额度，返回 `True`；重复确认最近已确认批次返回 `False`；其他版本抛
+  `RouteFeedState`。确认快照本身不消耗增量额度。
+
+### 提交语义、额度与资源边界
+
+通道开启后，执行器在每次 `apply_plan` 执行待登记阶段**之前**安装仅存在于
+该连接的 TEMP 捕获触发器（不在目录上建持久触发器），只记录本批实际触及的
+id 及其计划前取值；全部阶段成功后在 SQLite 内做集合式净变化比较，中间状态
+（包括同一 id 被多个阶段反复改写、改回原值、出现后又删除）一律不外发。净
+变化、批次行、额度更新与迁移账本在**同一次提交**落盘：净变化条数超过当前
+可用额度时抛 `RouteFeedFull(needed, available)`，本批全部 SQL、账本与通道
+状态一起回退，绝不发部分批次、不跳过积压、不自行确认。无净变化、准确重放
+或失败的调用不占额度、不生成批次；额度为零时净零批次仍可提交。
+
+`preview_plan` 按同一份事务状态重新判定增量与额度：会登记的版本列表正常
+返回且不留任何改动；若同样超额则同样抛 `RouteFeedFull`。额度只在确认事务
+提交后返还，读取、预演、重开进程、确认快照、计划重放都不返还。应用 SQL
+无法读写任何 `_route_feed_*` 内部对象（执行期授权器拦截）。
+
+持久通道数据至多为一份切点快照（确认后即删）加未确认批次与单行进度元数据；
+发布只对实际触及的 id 和有界通道状态做额外工作，不扫描未触及目录。各调用
+新增 Python 峰值分配（`tracemalloc`，按调用快照差值计）远低于 12 MiB；
+60,000 行、每行 320 字节目录下的开通、分页（页大小 7/256）、发布与预演均有
+测试覆盖。未开通通道的库保持原有行为，不创建任何通道对象。
+
 ## SQLite 副本群的维护批次
 
 `replica_waves.py` 在同一套迁移计划之上安排维护批次：同批节点从开批到收批

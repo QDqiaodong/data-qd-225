@@ -14,6 +14,11 @@ Only the standard library is used and ordinary plans behave exactly as before.
 ``CheckedMigration`` adds exact client-query multiset gates inside the same
 atomic transaction, while :func:`preview_plan` trial-runs a plan and rolls it
 back without publishing its ledger or schema changes.
+
+The route feed (``open_route_feed`` and friends) adds single-consumer,
+resumable change-data delivery for the ``route_catalog`` table: a consistent
+paged snapshot followed by complete, quota-bounded net-change batches that
+live in the same SQLite commits as the migration ledger.
 """
 from contextlib import closing
 from dataclasses import dataclass
@@ -530,9 +535,36 @@ class OnlineMigrationRequired(Exception):
     """The online version must be prepared and published before this advance."""
 
 
+class RouteFeedState(Exception):
+    """A route feed call was made in the wrong lifecycle/state."""
+
+
+class RouteFeedFull(Exception):
+    """A route batch needs more quota than the unacked change entries allow."""
+
+    def __init__(self, needed, available):
+        self.needed = needed
+        self.available = available
+        super().__init__(
+            "route feed full: %d change entries needed, %d slots available"
+            % (needed, available)
+        )
+
+
 _LEDGER = "_migration_ledger"
 _STATE = "_online_unique_state"
 _STATE_SLOT = 1
+
+_ROUTE_CATALOG = "route_catalog"
+_ROUTE_FEED_PREFIX = "_route_feed_"
+_ROUTE_FEED_META = "_route_feed_meta"
+_ROUTE_FEED_SNAPSHOT = "_route_feed_snapshot"
+_ROUTE_FEED_BATCHES = "_route_feed_batches"
+_ROUTE_FEED_TOUCHED = "_route_feed_touched"
+_ROUTE_FEED_TRG_INSERT = "_route_feed_capture_insert"
+_ROUTE_FEED_TRG_UPDATE = "_route_feed_capture_update"
+_ROUTE_FEED_TRG_DELETE = "_route_feed_capture_delete"
+_ROUTE_FEED_META_SLOT = 1
 
 
 # --------------------------------------------------------------------------
@@ -1332,6 +1364,7 @@ def _is_reserved_relation(name):
         or folded.startswith("_worker_profile_")
         or folded.startswith("_migration_qp_")
         or folded.startswith("_migration_reclaim_")
+        or folded.startswith(_ROUTE_FEED_PREFIX)
     )
 
 
@@ -1567,9 +1600,16 @@ def _apply_checked_migration(db, migration):
 # Ordinary plans
 
 
-def _authorize(action, first, second, *_):
+def _authorize(action, first, second, schema=None, *_):
     # The executor controls transactions and the ledger; a migration is trusted application SQL.
-    if '_migration_ledger' in {str(first).casefold(), str(second).casefold()}:
+    # TEMP objects (including the route feed capture triggers' target table)
+    # are private to this connection and never touch the committed catalog.
+    if schema == "temp":
+        return sqlite3.SQLITE_OK
+    names = {str(first).casefold(), str(second).casefold()}
+    if '_migration_ledger' in names or any(
+        name.startswith(_ROUTE_FEED_PREFIX) for name in names
+    ):
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_DENY if action in {
         sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT, sqlite3.SQLITE_ATTACH,
@@ -1628,6 +1668,9 @@ def _run_plan(path, plan, preview):
                     "the online migration must be published before it can be applied"
                 )
 
+        feed = _route_feed_meta(db)
+        _route_feed_arm(db, feed)
+
         applied = []
         for migration, (_, checksum) in zip(pending, keys[len(history):]):
             if isinstance(migration, CheckedMigration):
@@ -1651,6 +1694,10 @@ def _run_plan(path, plan, preview):
             )
             applied.append(migration.version)
 
+        if feed is not None and applied:
+            _route_feed_record(db, feed, applied[-1])
+        _route_feed_disarm(db)
+
         if preview:
             # Roll back schema, rows, ledger rows and every internal change.
             # Private TEMP staging tables are also removed when db closes.
@@ -1659,6 +1706,10 @@ def _run_plan(path, plan, preview):
             db.commit()
         return applied
     except BaseException:
+        try:
+            _route_feed_disarm(db)
+        except Exception:
+            pass
         try:
             db.rollback()
         except Exception:
@@ -1683,3 +1734,322 @@ def preview_plan(path, plan):
     transaction; a preview result is never used as commit evidence.
     """
     return _run_plan(path, plan, True)
+
+
+# --------------------------------------------------------------------------
+# Route feed: resumable snapshot + bounded, recoverable change batches
+#
+# Persistent channel objects (all private, never written by application SQL):
+#   _route_feed_meta      single-row channel state and progress
+#   _route_feed_snapshot  cut-point catalog rows; only while the snapshot is
+#                         unacked, then released
+#   _route_feed_batches   one row per unacked (version, id) change entry
+#
+# Per-plan temporary capture objects keep the net-change work proportional to
+# the actually touched ids; they never outlive the applying connection.
+# --------------------------------------------------------------------------
+
+
+def _nonbool_int(value, field_name):
+    if type(value) is not int:
+        raise ValueError("%s must be a non-boolean integer" % field_name)
+    return value
+
+
+def _positive_sqlite_int(value, field_name):
+    value = _nonbool_int(value, field_name)
+    if not 1 <= value <= _SQLITE_MAX_INTEGER:
+        raise ValueError("%s must be a positive SQLite integer" % field_name)
+    return value
+
+
+def _route_feed_meta(db):
+    """Return the channel meta row, or ``None`` when no channel exists."""
+    if not _has_table(db, _ROUTE_FEED_META):
+        return None
+    return db.execute(
+        "SELECT base_version, max_pending, used_pending, snapshot_done, "
+        "last_acked_batch FROM " + _ROUTE_FEED_META + " WHERE slot=?",
+        (_ROUTE_FEED_META_SLOT,),
+    ).fetchone()
+
+
+def _create_route_feed_objects(db):
+    db.execute(
+        "CREATE TABLE " + _ROUTE_FEED_META + " ("
+        "slot INTEGER PRIMARY KEY CHECK (slot=" + str(_ROUTE_FEED_META_SLOT) + "),"
+        "base_version INTEGER NOT NULL, max_pending INTEGER NOT NULL, "
+        "used_pending INTEGER NOT NULL, snapshot_done INTEGER NOT NULL, "
+        "last_acked_batch INTEGER)"
+    )
+    db.execute(
+        "CREATE TABLE " + _ROUTE_FEED_SNAPSHOT + " ("
+        "id INTEGER PRIMARY KEY, payload BLOB NOT NULL) WITHOUT ROWID"
+    )
+    db.execute(
+        "CREATE TABLE " + _ROUTE_FEED_BATCHES + " ("
+        "version INTEGER NOT NULL, id INTEGER NOT NULL, payload BLOB, "
+        "PRIMARY KEY (version, id)) WITHOUT ROWID"
+    )
+
+
+def open_route_feed(path, max_pending):
+    """Atomically open the single route feed and return its cut-point version.
+
+    The highest registered ledger version and the complete ``route_catalog``
+    state copied for paging come from one and the same database state: both
+    are observed inside one write transaction.  Reopening with the same quota
+    returns the original cut point; a different quota raises :class:`RouteFeedState`.
+    """
+    _nonbool_int(max_pending, "max_pending")
+    if not 1 <= max_pending <= 16384:
+        raise ValueError("max_pending must be an integer between 1 and 16384")
+
+    with closing(_open(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if not _has_table(db, _LEDGER):
+            raise RouteFeedState("no registered migration version exists")
+        base_version = db.execute(
+            "SELECT MAX(version) FROM " + _LEDGER
+        ).fetchone()[0]
+        if base_version is None or not 1 <= base_version <= _SQLITE_MAX_INTEGER:
+            raise RouteFeedState("no registered migration version exists")
+        if not _has_table(db, _ROUTE_CATALOG):
+            raise RouteFeedState("route_catalog does not exist")
+
+        existing = _route_feed_meta(db)
+        if existing is not None:
+            if existing[1] != max_pending:
+                raise RouteFeedState("the route feed already uses another quota")
+            return existing[0]
+
+        _create_route_feed_objects(db)
+        # The cut-point scan and the version read above share this one
+        # transaction, so every paged row belongs to the base_version state.
+        db.execute(
+            "INSERT INTO " + _ROUTE_FEED_SNAPSHOT + " (id, payload) "
+            "SELECT id, CAST(payload AS BLOB) FROM " + _ROUTE_CATALOG
+        )
+        db.execute(
+            "INSERT INTO " + _ROUTE_FEED_META + " "
+            "(slot, base_version, max_pending, used_pending, snapshot_done, "
+            "last_acked_batch) VALUES (?,?,?,0,0,NULL)",
+            (_ROUTE_FEED_META_SLOT, base_version, max_pending),
+        )
+        return base_version
+
+
+def read_route_snapshot(path, after_id, limit):
+    """Return one immutable cut-point page and the next cursor (or ``None``)."""
+    _nonbool_int(after_id, "after_id")
+    if after_id < 0 or after_id > _SQLITE_MAX_INTEGER:
+        raise ValueError("after_id must be a non-negative SQLite integer")
+    _nonbool_int(limit, "limit")
+    if not 1 <= limit <= 256:
+        raise ValueError("limit must be an integer between 1 and 256")
+
+    with closing(_open(path)) as db:
+        meta = _route_feed_meta(db)
+        if meta is None:
+            raise RouteFeedState("the route feed has not been opened")
+        if meta[3]:
+            raise RouteFeedState("the route snapshot has already been confirmed")
+        rows = [
+            (row_id, bytes(payload))
+            for row_id, payload in db.execute(
+                "SELECT id, payload FROM " + _ROUTE_FEED_SNAPSHOT
+                + " WHERE id>? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            )
+        ]
+    next_after = rows[-1][0] if rows else None
+    return rows, next_after
+
+
+def finish_route_snapshot(path, base_version):
+    """Confirm the snapshot; release its retained rows and return first-time.
+
+    Returns ``True`` on the first confirmation and ``False`` when retried.
+    Batches accumulated during paging are always retained.
+    """
+    _positive_sqlite_int(base_version, "base_version")
+
+    with closing(_open(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        meta = _route_feed_meta(db)
+        if meta is None:
+            raise RouteFeedState("the route feed has not been opened")
+        if meta[0] != base_version:
+            raise RouteFeedState("base_version does not match the feed cut point")
+        if meta[3]:
+            return False
+        db.execute("DELETE FROM " + _ROUTE_FEED_SNAPSHOT)
+        db.execute(
+            "UPDATE " + _ROUTE_FEED_META + " SET snapshot_done=1 WHERE slot=?",
+            (_ROUTE_FEED_META_SLOT,),
+        )
+        return True
+
+
+def read_route_changes(path):
+    """Return the earliest unacked ``(version, entries)`` batch, or ``None``."""
+    with closing(_open(path)) as db:
+        meta = _route_feed_meta(db)
+        if meta is None:
+            raise RouteFeedState("the route feed has not been opened")
+        if not meta[3]:
+            raise RouteFeedState("the route snapshot must be confirmed first")
+        row = db.execute(
+            "SELECT MIN(version) FROM " + _ROUTE_FEED_BATCHES
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        version = row[0]
+        entries = [
+            (row_id, None if payload is None else bytes(payload))
+            for row_id, payload in db.execute(
+                "SELECT id, payload FROM " + _ROUTE_FEED_BATCHES
+                + " WHERE version=? ORDER BY id",
+                (version,),
+            )
+        ]
+    return version, entries
+
+
+def ack_route_changes(path, version):
+    """Ack the earliest unacked batch and release its quota; return first-time."""
+    _positive_sqlite_int(version, "version")
+
+    with closing(_open(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        meta = _route_feed_meta(db)
+        if meta is None:
+            raise RouteFeedState("the route feed has not been opened")
+        if not meta[3]:
+            raise RouteFeedState("the route snapshot must be confirmed first")
+        last_acked = meta[4]
+        if last_acked is not None and version == last_acked:
+            # Repeated confirmation of the most recent ack: no progress change.
+            return False
+        row = db.execute(
+            "SELECT MIN(version) FROM " + _ROUTE_FEED_BATCHES
+        ).fetchone()
+        if row is None or row[0] is None or version != row[0]:
+            raise RouteFeedState(
+                "version is neither the next unacked batch nor the most "
+                "recently confirmed batch"
+            )
+        released = db.execute(
+            "SELECT COUNT(*) FROM " + _ROUTE_FEED_BATCHES + " WHERE version=?",
+            (version,),
+        ).fetchone()[0]
+        db.execute(
+            "DELETE FROM " + _ROUTE_FEED_BATCHES + " WHERE version=?", (version,)
+        )
+        db.execute(
+            "UPDATE " + _ROUTE_FEED_META
+            + " SET used_pending=used_pending-?, last_acked_batch=? WHERE slot=?",
+            (released, version, _ROUTE_FEED_META_SLOT),
+        )
+        return True
+
+
+def _route_feed_arm(db, feed):
+    """Install per-plan capture state for a live channel.
+
+    Temporary triggers record only the ids actually written by this plan (plus
+    each row's pre-plan value).  They live in TEMP and disappear with the
+    connection, so no persistent trigger is ever added to ``route_catalog``.
+    """
+    if feed is None:
+        return
+    catalog = _quote(_ROUTE_CATALOG)
+    touched = _quote(_ROUTE_FEED_TOUCHED)
+    db.execute("DROP TABLE IF EXISTS temp." + touched)
+    db.execute(
+        "CREATE TEMP TABLE " + touched + " ("
+        "id INTEGER PRIMARY KEY, before_payload BLOB) WITHOUT ROWID"
+    )
+    # Temp objects resolve first in unqualified name lookup, so the trigger
+    # bodies reference the capture table without a schema qualifier (SQLite
+    # forbids qualified target names inside trigger bodies).
+    db.execute(
+        "CREATE TEMP TRIGGER " + _quote(_ROUTE_FEED_TRG_INSERT)
+        + " AFTER INSERT ON " + catalog + " BEGIN "
+        "INSERT OR IGNORE INTO " + touched + " (id, before_payload) "
+        "VALUES (NEW.id, NULL); END"
+    )
+    db.execute(
+        "CREATE TEMP TRIGGER " + _quote(_ROUTE_FEED_TRG_UPDATE)
+        + " AFTER UPDATE ON " + catalog + " BEGIN "
+        "INSERT OR IGNORE INTO " + touched + " (id, before_payload) "
+        "VALUES (OLD.id, CAST(OLD.payload AS BLOB)); END"
+    )
+    db.execute(
+        "CREATE TEMP TRIGGER " + _quote(_ROUTE_FEED_TRG_DELETE)
+        + " AFTER DELETE ON " + catalog + " BEGIN "
+        "INSERT OR IGNORE INTO " + touched + " (id, before_payload) "
+        "VALUES (OLD.id, CAST(OLD.payload AS BLOB)); END"
+    )
+
+
+def _route_feed_disarm(db):
+    for name in (
+        _ROUTE_FEED_TRG_INSERT,
+        _ROUTE_FEED_TRG_UPDATE,
+        _ROUTE_FEED_TRG_DELETE,
+        _ROUTE_FEED_TOUCHED,
+    ):
+        kind = "TRIGGER" if name.startswith("_route_feed_capture") else "TABLE"
+        db.execute("DROP " + kind + " IF EXISTS temp." + _quote(name))
+
+
+def _route_feed_record(db, feed, version):
+    """Publish this plan's net route changes as one complete batch.
+
+    The diff is set-based in SQLite over only the touched ids, and commits in
+    the caller's transaction together with the ledger and quota update.  A
+    quota shortfall raises :class:`RouteFeedFull` before any channel write, so
+    the whole plan (SQL, ledger, channel state) rolls back together.
+    """
+    base_version, max_pending, used_pending, snapshot_done, _ = feed
+    if version <= base_version:
+        return
+    catalog = _quote(_ROUTE_CATALOG)
+    touched = _quote(_ROUTE_FEED_TOUCHED)
+    batches = _quote(_ROUTE_FEED_BATCHES)
+
+    needed = db.execute(
+        "SELECT COUNT(*) FROM temp." + touched + " AS t LEFT JOIN " + catalog
+        + " AS c ON c.id=t.id "
+        "WHERE c.id IS NULL "
+        "OR CAST(c.payload AS BLOB) IS NOT t.before_payload"
+    ).fetchone()[0]
+
+    available = max_pending - used_pending
+    if needed > available:
+        raise RouteFeedFull(needed, available)
+    if needed == 0:
+        return
+
+    # NULL payload marks a deleted id; otherwise the row carries the final
+    # committed BLOB.  Only genuine net changes get an entry, so exact replays
+    # and change-back sequences publish nothing.
+    db.execute(
+        "INSERT INTO " + batches + " (version, id, payload) "
+        "SELECT ?, c.id, CAST(c.payload AS BLOB) FROM " + catalog
+        + " AS c JOIN temp." + touched + " AS t ON t.id=c.id "
+        "WHERE CAST(c.payload AS BLOB) IS NOT t.before_payload",
+        (version,),
+    )
+    db.execute(
+        "INSERT INTO " + batches + " (version, id, payload) "
+        "SELECT ?, t.id, NULL FROM temp." + touched + " AS t "
+        "WHERE NOT EXISTS (SELECT 1 FROM " + catalog + " AS c WHERE c.id=t.id)",
+        (version,),
+    )
+    db.execute(
+        "UPDATE " + _ROUTE_FEED_META + " SET used_pending=used_pending+? "
+        "WHERE slot=?",
+        (needed, _ROUTE_FEED_META_SLOT),
+    )
