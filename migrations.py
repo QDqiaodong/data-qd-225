@@ -124,8 +124,184 @@ class ReleaseArtifactReclaim:
         ).hexdigest()
 
 
+_MAX_ROLLOUT_STATEMENTS = 64
+_MAX_ROLLOUT_STATEMENT_BYTES = 4096
+_PROFILE_TABLE = "worker_profiles"
+_DELTA_TABLE = "_worker_profile_rollout_delta"
+_ROLLOUT_SNAPSHOT = "_worker_profile_rollout_before"
+_RESTORE_PLAN = "_worker_profile_restore_plan"
+
+
+def _strip_sql_literals(sql):
+    """Blank out single-quoted strings and comments for structural checks."""
+    out = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char == "'":
+            index += 1
+            while index < length:
+                if sql[index] == "'":
+                    if index + 1 < length and sql[index + 1] == "'":
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            out.append(" ")
+        elif char == "-" and index + 1 < length and sql[index + 1] == "-":
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            out.append(" ")
+        elif char == "/" and index + 1 < length and sql[index + 1] == "*":
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            out.append(" ")
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+_ROLLOUT_TARGET = re.compile(
+    r"""\s*(?:
+        INSERT\s+INTO\s+(?:main\s*\.\s*)?["`\[]?([A-Za-z_]\w*)
+      | UPDATE\s+(?:main\s*\.\s*)?["`\[]?([A-Za-z_]\w*)
+      | DELETE\s+FROM\s+(?:main\s*\.\s*)?["`\[]?([A-Za-z_]\w*)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_UPSERT_CLAUSE = re.compile(r"\bON\s+CONFLICT\b", re.IGNORECASE)
+_CONFLICT_MODIFIER = re.compile(
+    r"\s*(?:INSERT|UPDATE)\s+OR\b", re.IGNORECASE
+)
+
+
+def _validate_rollout_statements(statements):
+    if isinstance(statements, (str, bytes, bytearray)):
+        raise ValueError("statements must be an ordered collection of SQL strings")
+    try:
+        raw = tuple(statements)
+    except TypeError:
+        raise ValueError("statements must be an ordered collection of SQL strings") from None
+    if not 1 <= len(raw) <= _MAX_ROLLOUT_STATEMENTS:
+        raise ValueError("between 1 and 64 rollout statements are required")
+
+    checked = []
+    for statement in raw:
+        if not isinstance(statement, str):
+            raise ValueError("rollout statements must be strings")
+        if len(statement.encode("utf-8")) > _MAX_ROLLOUT_STATEMENT_BYTES:
+            raise ValueError("rollout statements must not exceed 4096 UTF-8 bytes")
+        structural = _strip_sql_literals(statement)
+        fragments = [part for part in structural.split(";") if part.strip()]
+        if not fragments:
+            raise ValueError("rollout statements must not be empty")
+        if len(fragments) > 1:
+            raise ValueError("each rollout statement must be a single SQL statement")
+        match = _ROLLOUT_TARGET.match(structural)
+        if match is None:
+            raise ValueError(
+                "rollout statements must be plain INSERT, UPDATE or DELETE on worker_profiles"
+            )
+        target = next(group for group in match.groups() if group is not None)
+        if target.casefold() != _PROFILE_TABLE:
+            raise ValueError("rollout statements may only write worker_profiles")
+        if _CONFLICT_MODIFIER.match(structural):
+            raise ValueError("rollout statements must not use REPLACE or conflict clauses")
+        if _UPSERT_CLAUSE.search(structural):
+            raise ValueError("rollout statements must not use conflict clauses")
+        checked.append(statement)
+    return tuple(checked)
+
+
+@dataclass(frozen=True)
+class WorkerProfileRollout:
+    """Publish an ordered batch of profile writes and keep rollback evidence.
+
+    The checksum lives in its own hashing domain and binds the version and the
+    ordered statement text, so a reordered or edited batch is history drift.
+    """
+
+    version: int
+    statements: tuple
+
+    def __post_init__(self):
+        if type(self.version) is not int or not 1 <= self.version <= _SQLITE_MAX_INTEGER:
+            raise ValueError("rollout version must be a positive SQLite integer")
+        object.__setattr__(
+            self, "statements", _validate_rollout_statements(self.statements)
+        )
+
+    def checksum(self):
+        payload = json.dumps(
+            {
+                "kind": "worker-profile-rollout",
+                "version": self.version,
+                "statements": list(self.statements),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            ("worker-profile-rollout\x00" + payload).encode()
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class RestoreWorkerProfiles:
+    """A new migration version that restores an adjacent rollout's net changes.
+
+    ``rollout_version`` must be exactly ``version - 1``: the restore refers to
+    the immediately preceding rollout version in the plan.
+    """
+
+    version: int
+    rollout_version: int
+
+    def __post_init__(self):
+        if type(self.version) is not int or not 1 <= self.version <= _SQLITE_MAX_INTEGER:
+            raise ValueError("restore version must be a positive SQLite integer")
+        if (
+            type(self.rollout_version) is not int
+            or not 1 <= self.rollout_version <= _SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("rollout_version must be a positive SQLite integer")
+        if self.rollout_version != self.version - 1:
+            raise ValueError("a restore must refer to the immediately preceding rollout")
+
+    def checksum(self):
+        payload = json.dumps(
+            {
+                "kind": "worker-profile-restore",
+                "version": self.version,
+                "rollout_version": self.rollout_version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            ("worker-profile-restore\x00" + payload).encode()
+        ).hexdigest()
+
+
 class HistoryMismatch(Exception):
     pass
+
+
+class ProfileRestoreBlocked(Exception):
+    """A restore cannot delete a profile that jobs still pin."""
+
+    def __init__(self, profile_id, job_id):
+        self.profile_id = profile_id
+        self.job_id = job_id
+        super().__init__(
+            "worker profile %d is still pinned by job %d"
+            % (profile_id, job_id)
+        )
 
 
 class OnlineMigrationRequired(Exception):
@@ -237,11 +413,26 @@ def _parse_plan(plan, require_online=False, online_last=False):
             # The reclaim phase carries no SQL statements but is an ordinary,
             # atomic ledger phase handled by apply_plan itself.
             pass
+        elif isinstance(item, (WorkerProfileRollout, RestoreWorkerProfiles)):
+            # Both are ordinary atomic ledger phases executed by apply_plan.
+            pass
         else:
             if not getattr(item, "statements", None) or not callable(
                 getattr(item, "checksum", None)
             ):
                 raise ValueError("plans must be complete and numbered consecutively from 1")
+
+    by_version = {item.version: item for item in plan}
+    for item in plan:
+        if isinstance(item, RestoreWorkerProfiles):
+            rollout = by_version.get(item.rollout_version)
+            if (
+                item.rollout_version != item.version - 1
+                or not isinstance(rollout, WorkerProfileRollout)
+            ):
+                raise ValueError(
+                    "a restore must refer to the immediately preceding rollout phase"
+                )
 
     online_count = sum(isinstance(item, OnlineUnique) for item in plan)
     if online_count > 1:
@@ -732,6 +923,165 @@ def _apply_release_artifact_reclaim(db, reclaim):
 
 
 # --------------------------------------------------------------------------
+# Worker profile rollout and restoration
+
+
+def _ensure_delta_table(db):
+    # SQL NULL means "no such profile row at that point"; BLOB 0 bytes is a
+    # valid configuration distinct from absence.
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS " + _DELTA_TABLE + " ("
+        "rollout_version INTEGER NOT NULL, profile_id INTEGER NOT NULL, "
+        "before_config BLOB, after_config BLOB, "
+        "PRIMARY KEY (rollout_version, profile_id))"
+    )
+
+
+def _apply_worker_profile_rollout(db, rollout):
+    """Run the batch, record one net-change row per id, and ledger the version.
+
+    The baseline is the state just before this rollout's first statement; the
+    final state is that after its last statement.  ``before`` is materialised
+    in a bounded SQLite temporary table (the only touched ids), never in
+    Python memory.  Everything commits with the surrounding apply_plan
+    transaction, so a later statement failure rolls it all back.
+    """
+    count = db.execute(
+        "SELECT COUNT(*) FROM " + _PROFILE_TABLE
+    ).fetchone()[0]
+    if count > 250000:
+        raise ValueError("too many worker profiles to snapshot safely")
+
+    _ensure_delta_table(db)
+    db.execute("DROP TABLE IF EXISTS temp." + _quote(_ROLLOUT_SNAPSHOT))
+    db.execute(
+        "CREATE TEMP TABLE " + _quote(_ROLLOUT_SNAPSHOT) + " ("
+        "profile_id INTEGER PRIMARY KEY, config BLOB NOT NULL)"
+    )
+    db.execute(
+        "INSERT INTO temp." + _quote(_ROLLOUT_SNAPSHOT) + " (profile_id, config) "
+        "SELECT id, CAST(config AS BLOB) FROM " + _PROFILE_TABLE
+    )
+
+    db.set_authorizer(_authorize)
+    try:
+        for statement in rollout.statements:
+            db.execute(statement)
+    finally:
+        db.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
+
+    before = _quote(_ROLLOUT_SNAPSHOT)
+    profiles = _quote(_PROFILE_TABLE)
+    delta = _quote(_DELTA_TABLE)
+    # One row per net-changed id whose before value was recorded above.  (A
+    # pre-existing id can only be absent before if it never existed there.)
+    db.execute(
+        "INSERT INTO " + delta + " "
+        "(rollout_version, profile_id, before_config, after_config) "
+        "SELECT ?, b.profile_id, b.config, CAST(a.config AS BLOB) "
+        "FROM temp." + before + " AS b LEFT JOIN " + profiles + " AS a "
+        "ON a.id = b.profile_id "
+        "WHERE a.config IS NULL OR CAST(a.config AS BLOB) IS NOT b.config",
+        (rollout.version,),
+    )
+    # Ids absent before the rollout and created by it.
+    db.execute(
+        "INSERT INTO " + delta + " "
+        "(rollout_version, profile_id, before_config, after_config) "
+        "SELECT ?, a.id, NULL, CAST(a.config AS BLOB) "
+        "FROM " + profiles + " AS a "
+        "WHERE NOT EXISTS (SELECT 1 FROM temp." + before + " AS b "
+        "WHERE b.profile_id = a.id)",
+        (rollout.version,),
+    )
+    db.execute("DROP TABLE temp." + before)
+
+
+def _apply_worker_profile_restore(db, restore):
+    """Restore the adjacent rollout's net changes where the site is unchanged.
+
+    The decision is made set-based in SQLite so no catalog is materialised in
+    Python.  Deletion eligibility (after state absent), pin checks and the
+    applied mutations all happen in the caller's transaction.
+    """
+    version = restore.rollout_version
+    row = db.execute(
+        "SELECT 1 FROM " + _LEDGER + " WHERE version=?", (version,)
+    ).fetchone()
+    if row is None:
+        raise HistoryMismatch("the rollout to restore is not registered")
+    if not _has_table(db, _DELTA_TABLE):
+        raise HistoryMismatch("the rollout to restore has no recorded changes")
+
+    profiles = _quote(_PROFILE_TABLE)
+    delta = _quote(_DELTA_TABLE)
+    pins = _quote("job_profile_pins")
+    plan = _quote(_RESTORE_PLAN)
+
+    # Decide every net-changed id at once.  "restore" means the site still
+    # equals the recorded after state; then we move it to the before state.
+    db.execute("DROP TABLE IF EXISTS temp." + plan)
+    db.execute(
+        "CREATE TEMP TABLE " + plan + " ("
+        "profile_id INTEGER PRIMARY KEY, "
+        "before_config BLOB, after_config BLOB, "
+        "action TEXT NOT NULL)"
+    )
+    db.execute(
+        "INSERT INTO temp." + plan + " "
+        "(profile_id, before_config, after_config, action) "
+        "SELECT d.profile_id, d.before_config, d.after_config, "
+        "CASE "
+        "WHEN d.after_config IS NULL THEN "
+        "  CASE WHEN p.id IS NULL THEN 'restore' ELSE 'keep' END "
+        "WHEN p.id IS NOT NULL "
+        "  AND CAST(p.config AS BLOB) IS d.after_config THEN 'restore' "
+        "ELSE 'keep' END "
+        "FROM " + delta + " AS d "
+        "LEFT JOIN " + profiles + " AS p ON p.id = d.profile_id "
+        "WHERE d.rollout_version=?",
+        (version,),
+    )
+
+    # A restore that would delete a profile (before state absent) is blocked
+    # when any job still pins it.  Pick the numerically least (profile, job).
+    blocked = db.execute(
+        "SELECT r.profile_id, MIN(j.job_id) FROM temp." + plan + " AS r "
+        "JOIN " + pins + " AS j ON j.profile_id = r.profile_id "
+        "WHERE r.action='restore' AND r.before_config IS NULL "
+        "GROUP BY r.profile_id ORDER BY r.profile_id LIMIT 1"
+    ).fetchone()
+    if blocked is not None:
+        raise ProfileRestoreBlocked(blocked[0], blocked[1])
+
+    # Updates: rows that exist and whose before state is a real config.
+    db.execute(
+        "UPDATE " + profiles + " SET config=("
+        "SELECT r.before_config FROM temp." + plan + " AS r "
+        "WHERE r.profile_id=" + profiles + ".id) "
+        "WHERE id IN (SELECT profile_id FROM temp." + plan + " "
+        "WHERE action='restore' AND before_config IS NOT NULL)"
+    )
+    # Deletions: rows that exist and whose before state was absent.
+    db.execute(
+        "DELETE FROM " + profiles + " WHERE id IN ("
+        "SELECT r.profile_id FROM temp." + plan + " AS r "
+        "WHERE r.action='restore' AND r.before_config IS NULL "
+        "AND EXISTS (SELECT 1 FROM " + profiles + " AS p "
+        "WHERE p.id = r.profile_id))"
+    )
+    # Re-insertions: the rollout deleted the profile and the site still lacks
+    # it, so the recorded before state comes back.
+    db.execute(
+        "INSERT INTO " + profiles + " (id, config) "
+        "SELECT r.profile_id, r.before_config FROM temp." + plan + " AS r "
+        "WHERE r.action='restore' AND r.before_config IS NOT NULL "
+        "AND r.after_config IS NULL"
+    )
+    db.execute("DROP TABLE temp." + plan)
+
+
+# --------------------------------------------------------------------------
 # Ordinary plans
 
 
@@ -760,6 +1110,17 @@ def apply_plan(path, plan):
 
         pending = plan[len(history):]
         if pending:
+            # A restore may only undo a rollout that was already committed
+            # before this call began: never run a rollout and its restore as
+            # one uncommitted change.
+            for item in pending:
+                if (
+                    isinstance(item, RestoreWorkerProfiles)
+                    and item.rollout_version > len(history)
+                ):
+                    raise ValueError(
+                        "the rollout must be registered before its restore can apply"
+                    )
             state = _load_state(db)
             if state is not None:
                 if online is not None and _state_identity(state) != (
@@ -781,7 +1142,11 @@ def apply_plan(path, plan):
 
         applied = []
         for migration, (_, checksum) in zip(pending, keys[len(history):]):
-            if isinstance(migration, ReleaseArtifactReclaim):
+            if isinstance(migration, WorkerProfileRollout):
+                _apply_worker_profile_rollout(db, migration)
+            elif isinstance(migration, RestoreWorkerProfiles):
+                _apply_worker_profile_restore(db, migration)
+            elif isinstance(migration, ReleaseArtifactReclaim):
                 _apply_release_artifact_reclaim(db, migration)
             else:
                 db.set_authorizer(_authorize)

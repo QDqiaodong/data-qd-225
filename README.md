@@ -81,3 +81,45 @@ apply_plan(path, plan)
 回收删除和账本记录一起回滚。准确计划重放为 no-op；改变候选集合或额度会因
 checksum 不同抛出 `HistoryMismatch`。它也可以位于已发布的 `OnlineUnique`
 之后；未发布的在线版本仍按原规则阻止账本推进。
+
+## worker 执行配置的发布与撤回
+
+计划中可以放入两个相邻的原子阶段：
+
+```python
+from migrations import (
+    Migration, RestoreWorkerProfiles, WorkerProfileRollout,
+    ProfileRestoreBlocked, apply_plan,
+)
+
+rollout = WorkerProfileRollout(2, (
+    "UPDATE worker_profiles SET config=x'11' WHERE id=10",
+    "DELETE FROM worker_profiles WHERE id=20",
+    "INSERT INTO worker_profiles(id, config) VALUES (40, x'dd')",
+))
+restore = RestoreWorkerProfiles(3, 2)      # 必须是紧邻的上一个版本
+plan = [Migration(1, (...)), rollout, restore]
+
+apply_plan(path, plan[:2])                 # 上线，登记 version 2
+apply_plan(path, plan)                     # 撤回，登记 version 3
+```
+
+`WorkerProfileRollout` 携带 1–64 条有序、只写 `worker_profiles` 的普通
+`INSERT`/`UPDATE`/`DELETE`（单条、无 REPLACE/冲突策略/事务控制/DDL）。执行时
+按“阶段前 vs 最后一条语句后”比较，每个净变化 id 只写一行到只读证据表
+`_worker_profile_rollout_delta(rollout_version, profile_id, before_config,
+after_config)`；`NULL` 表示该时点无此行，`x''` 是合法空配置，与不存在不同。
+改回原值或出现后又消失的 id 不留记录，空净变化的上线仍登记版本。
+
+`RestoreWorkerProfiles(version, version - 1)` 只处理该上线的净变化 id：现场仍
+等于上线后状态时才还原到上线前状态，否则原样保留；未被上线改变的 profile 绝不
+触碰。若还原需要删除的 profile 仍被 `job_profile_pins` 引用，整次撤回抛
+`ProfileRestoreBlocked(profile_id, job_id)`（取数值字典序最小的 `(profile,
+job)` 见证），不删 pin、不改数据、不登记版本；删除 pin 后同一计划可重试。
+撤回是一个新版本，不回滚 schema，也不删除证据。上线与其撤回不能在同一份未提交
+批次里：撤回引用的上线必须在此次调用开始时已登记，否则抛 `ValueError`。
+
+结构或参数错误抛 `ValueError`；滚动/语句顺序或撤回参数漂移抛
+`HistoryMismatch`。两阶段都有稳定 `checksum()`，绑定类型、版本及有序语句或被
+撤回版本。大目录下的比较与写入全部在 SQLite 内以集合方式完成，Python 侧不
+持有目录，单次调用新增峰值分配（`tracemalloc`）远低于 20 MiB。
